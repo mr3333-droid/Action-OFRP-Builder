@@ -4,22 +4,71 @@ on:
   workflow_dispatch:
     inputs:
       device_tree_url:
-        description: "Select device tree repository"
+        description: "Device tree repository URL (GitHub or GitLab)"
         required: true
-        type: choice
-        default: https://github.com/AzzyC/ofox_device_xiaomi_peridot
-        options:
-          - https://github.com/AzzyC/ofox_device_xiaomi_peridot
-          - https://gitlab.com/OrangeFox/device/peridot_new
+        type: string
+        default: ""
 
       device_tree_branch:
-        description: "Select device tree branch"
+        description: "Device tree branch"
         required: true
-        default: fox_14.1
+        type: string
+        default: ""
+
+      device_path:
+        description: "Device path (ex: device/xiaomi/zorn)"
+        required: true
+        type: string
+        default: ""
+
+      device_name:
+        description: "Device codename (ex: zorn)"
+        required: true
+        type: string
+        default: ""
+
+      makefile_name:
+        description: "Makefile name (ex: twrp_zorn)"
+        required: true
+        type: string
+        default: ""
+
+      build_target:
+        description: "Build target"
+        required: true
         type: choice
+        default: recovery
         options:
-          - fox_14.1
-          - auto-dfe
+          - recovery
+          - boot
+          - vendorboot
+
+      dt_token:
+        description: "Personal Access Token (leave empty for public repos)"
+        required: false
+        type: string
+        default: ""
+
+      telegram_bot_token:
+        description: "Telegram Bot Token (leave empty to disable)"
+        required: false
+        type: string
+        default: ""
+
+      telegram_chat_id:
+        description: "Telegram Chat ID (leave empty to disable)"
+        required: false
+        type: string
+        default: ""
+
+      create_release:
+        description: "Create public GitHub Release?"
+        required: true
+        type: choice
+        default: "No — Artifacts only (private)"
+        options:
+          - "Yes — Create Release (public)"
+          - "No — Artifacts only (private)"
 
 jobs:
   build:
@@ -29,35 +78,81 @@ jobs:
       contents: write
 
     env:
-      SYNC_URL: https://gitlab.com/OrangeFox/sync.git
-      MANIFEST_BRANCH: 14.1
+      SYNC_URL: https://github.com/OrangeFox16/sync.git
+      MANIFEST_BRANCH: "16.0"
       DEVICE_TREE_URL: ${{ inputs.device_tree_url }}
       DEVICE_TREE_BRANCH: ${{ inputs.device_tree_branch }}
-      DEVICE_PATH: device/xiaomi/peridot
-      DEVICE_NAME: peridot
-      MAKEFILE_NAME: twrp_peridot
-      BUILD_TARGET: recovery
+      DEVICE_PATH: ${{ inputs.device_path }}
+      DEVICE_NAME: ${{ inputs.device_name }}
+      MAKEFILE_NAME: ${{ inputs.makefile_name }}
+      BUILD_TARGET: ${{ inputs.build_target }}
+      DT_TOKEN: ${{ inputs.dt_token }}
+      TG_BOT_TOKEN: ${{ inputs.telegram_bot_token }}
+      TG_CHAT_ID: ${{ inputs.telegram_chat_id }}
+      CREATE_RELEASE: ${{ inputs.create_release }}
 
     steps:
-
-    # Cleanup The Actions Workspace Using Custom Composite Run Actions
-    - name: Cleanup
-      uses: rokibhasansagar/slimhub_actions@main
-
-    - name: Create Telegram sender script
+    
+    - name: "TEST: Verify device tree access FIRST"
       run: |
-        cat <<'EOF' > /tmp/send_msg.sh
+        DT_URL="${{ env.DEVICE_TREE_URL }}"
+        ORIGINAL_URL="$DT_URL"
+        TOKEN="${{ env.DT_TOKEN }}"
+        
+        echo "=============================================="
+        echo " Testing device tree access..."
+        echo " URL    : $DT_URL"
+        echo " Branch : ${{ env.DEVICE_TREE_BRANCH }}"
+        echo "=============================================="
+        
+        if [ -n "$TOKEN" ]; then
+          if echo "$DT_URL" | grep -q "github.com"; then
+            DT_URL=$(echo "$DT_URL" | sed "s|https://github.com/|https://oauth2:${TOKEN}@github.com/|")
+            echo "🔑 Using provided token for GitHub"
+          elif echo "$DT_URL" | grep -q "gitlab.com"; then
+            DT_URL=$(echo "$DT_URL" | sed "s|https://gitlab.com/|https://oauth2:${TOKEN}@gitlab.com/|")
+            echo "🔑 Using provided token for GitLab"
+          fi
+        else
+          echo "ℹ️  No token provided — trying public access"
+        fi
+        
+        echo "AUTH_URL=$DT_URL" >> $GITHUB_ENV
+        echo "ORIGINAL_URL=$ORIGINAL_URL" >> $GITHUB_ENV
+        
+        if git ls-remote --exit-code "$DT_URL" 2>/dev/null; then
+          echo "✅ Device tree accessible! Continuing build..."
+        else
+          echo "❌ FATAL: Cannot access device tree."
+          echo "   Check: URL, branch name, or token validity."
+          exit 1
+        fi
+
+    - name: Setup Telegram notifications
+      run: |
+        if [ -n "${{ env.TG_BOT_TOKEN }}" ] && [ -n "${{ env.TG_CHAT_ID }}" ]; then
+          cat <<'EOF' > /tmp/send_msg.sh
         #!/bin/bash
         MSG="$(printf "$1")"
         curl -s --fail \
-          -X POST "https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendMessage" \
-          -d chat_id="${{ secrets.TELEGRAM_CHAT_ID }}" \
+          -X POST "https://api.telegram.org/bot${{ env.TG_BOT_TOKEN }}/sendMessage" \
+          -d chat_id="${{ env.TG_CHAT_ID }}" \
           -d text="$MSG" \
           -d parse_mode="Markdown" \
           -d disable_web_page_preview=true \
         > /dev/null 2>&1 || true
         EOF
-        chmod +x /tmp/send_msg.sh
+          chmod +x /tmp/send_msg.sh
+          echo "TELEGRAM_ENABLED=true" >> $GITHUB_ENV
+        else
+          echo '#!/bin/bash' > /tmp/send_msg.sh
+          echo 'exit 0' >> /tmp/send_msg.sh
+          chmod +x /tmp/send_msg.sh
+          echo "TELEGRAM_ENABLED=false" >> $GITHUB_ENV
+        fi
+
+    - name: Cleanup
+      uses: rokibhasansagar/slimhub_actions@main
 
     - name: Initialize workspace
       run: |
@@ -95,8 +190,8 @@ jobs:
     - name: Clone device tree
       run: |
         /tmp/send_msg.sh "🌲 Cloning device tree for \`${{ env.DEVICE_NAME }}\`..."
-        cd ${{ steps.pwd.outputs.workspace-folder }}/fox_${{ env.MANIFEST_BRANCH }}
-        git clone --depth=1 ${{ env.DEVICE_TREE_URL }} -b ${{ env.DEVICE_TREE_BRANCH }} ./${{ env.DEVICE_PATH }}
+        cd "${{ steps.pwd.outputs.workspace-folder }}/fox_${{ env.MANIFEST_BRANCH }}"
+        git clone --depth=1 "${{ env.AUTH_URL }}" -b "${{ env.DEVICE_TREE_BRANCH }}" "./${{ env.DEVICE_PATH }}"
       working-directory: ${{ steps.pwd.outputs.workspace-folder }}
 
     - name: Get latest device tree commit
@@ -106,13 +201,14 @@ jobs:
         LATEST_COMMIT=$(git rev-parse --short=7 HEAD)
         echo "LATEST_COMMIT=$LATEST_COMMIT" >> $GITHUB_OUTPUT
         echo "Latest device tree commit: $LATEST_COMMIT"
-        /tmp/send_msg.sh "🌲 Device tree: [${LATEST_COMMIT}](${{ env.DEVICE_TREE_URL }}/tree/$LATEST_COMMIT)"
+        DISPLAY_URL=$(echo "${{ env.ORIGINAL_URL }}" | sed 's|https://oauth2:[^@]*@|https://|')
+        /tmp/send_msg.sh "🌲 Device tree: [${LATEST_COMMIT}](${DISPLAY_URL}/tree/$LATEST_COMMIT)"
       working-directory: ${{ steps.pwd.outputs.workspace-folder }}
 
     - name: Set Swap Space
       uses: pierotofy/set-swap-space@master
       with:
-        swap-size-gb: 12
+        swap-size-gb: 40
 
     - name: Building recovery
       run: |
@@ -122,7 +218,8 @@ jobs:
         source build/envsetup.sh
         export ALLOW_MISSING_DEPENDENCIES=true
         set -e
-        lunch ${{ env.MAKEFILE_NAME }}-ap2a-eng && make clean && mka adbd ${{ env.BUILD_TARGET }}image -j$(nproc --all)
+        lunch ${{ env.MAKEFILE_NAME }}-bp2a-eng
+        mka adbd ${{ env.BUILD_TARGET }}image -j$(nproc --all)
       working-directory: ${{ steps.pwd.outputs.workspace-folder }}
       continue-on-error: true
 
@@ -132,12 +229,13 @@ jobs:
         /tmp/send_msg.sh "❌ Build failed for \`${{ env.DEVICE_NAME }}\` (\`${{ env.MANIFEST_BRANCH }}\`)\n🔗 [View Workflow Run](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})"
         exit 1
 
-    - name: Check the output directory before uploading
+    - name: Check output directory
       run: |
-        /tmp/send_msg.sh "🧾 Checking output directory..."
-        ls ${{ steps.pwd.outputs.workspace-folder }}/fox_${{ env.MANIFEST_BRANCH }}/out/target/product/${{ env.DEVICE_NAME }}/
+        echo "Output files:"
+        ls -la "${{ steps.pwd.outputs.workspace-folder }}/fox_${{ env.MANIFEST_BRANCH }}/out/target/product/${{ env.DEVICE_NAME }}/"
 
     - name: Upload to Release
+      if: ${{ env.CREATE_RELEASE == 'Yes — Create Release (public)' }}
       uses: softprops/action-gh-release@v2
       with:
         files: |
@@ -149,13 +247,31 @@ jobs:
           Manifest: ${{ env.MANIFEST_BRANCH }}
           Device: ${{ env.DEVICE_NAME }}
           Target: ${{ env.BUILD_TARGET }}
-          Device tree commit: [${{ steps.devtree_commit.outputs.LATEST_COMMIT }}](${{ env.DEVICE_TREE_URL }}/tree/${{ steps.devtree_commit.outputs.LATEST_COMMIT }})
+          Device tree commit: [${{ steps.devtree_commit.outputs.LATEST_COMMIT }}](${{ env.ORIGINAL_URL }}/tree/${{ steps.devtree_commit.outputs.LATEST_COMMIT }})
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
     - name: Notify Release
-      if: success()
+      if: ${{ env.CREATE_RELEASE == 'Yes — Create Release (public)' }}
       run: |
         RELEASE_URL="https://github.com/${{ github.repository }}/releases/tag/${{ github.run_id }}"
-        DEVICE_TREE_BROWSE_URL="${{ env.DEVICE_TREE_URL }}/tree/${{ steps.devtree_commit.outputs.LATEST_COMMIT }}"
-        /tmp/send_msg.sh "📦 *Build complete!*\n🔗 [Download]($RELEASE_URL)\n🌲 Device tree commit: [${{ steps.devtree_commit.outputs.LATEST_COMMIT }}]($DEVICE_TREE_BROWSE_URL)"
+        /tmp/send_msg.sh "📦 *Build complete!*\n🔗 [Download]($RELEASE_URL)"
+
+    - name: Upload as Artifact (private)
+      if: ${{ env.CREATE_RELEASE != 'Yes — Create Release (public)' }}
+      uses: actions/upload-artifact@v4
+      with:
+        name: ${{ env.DEVICE_NAME }}-recovery
+        path: |
+          ${{ steps.pwd.outputs.workspace-folder }}/fox_${{ env.MANIFEST_BRANCH }}/out/target/product/${{ env.DEVICE_NAME }}/recovery.img
+          ${{ steps.pwd.outputs.workspace-folder }}/fox_${{ env.MANIFEST_BRANCH }}/out/target/product/${{ env.DEVICE_NAME }}/OrangeFox-R*.zip
+        retention-days: 90
+
+    - name: Notify Build Complete
+      if: success()
+      run: |
+        if [ "${{ env.CREATE_RELEASE }}" = "Yes — Create Release (public)" ]; then
+          /tmp/send_msg.sh "📦 *Build complete!* Check the Release tab."
+        else
+          /tmp/send_msg.sh "📦 *Build complete!* Artifact available in Actions tab (private, expires in 90 days)."
+        fi
