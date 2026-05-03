@@ -74,6 +74,7 @@ jobs:
   build:
     if: github.event.repository.owner.id == github.event.sender.id
     runs-on: ubuntu-24.04
+    timeout-minutes: 360
     permissions:
       contents: write
 
@@ -90,6 +91,8 @@ jobs:
       TG_BOT_TOKEN: ${{ inputs.telegram_bot_token }}
       TG_CHAT_ID: ${{ inputs.telegram_chat_id }}
       CREATE_RELEASE: ${{ inputs.create_release }}
+      WATCH_UNTIL_SECONDS: 20700
+      WATCH_INTERVAL_SECONDS: 600
 
     steps:
     
@@ -187,6 +190,16 @@ jobs:
         ./orangefox_sync.sh --branch ${{ env.MANIFEST_BRANCH }} --path ${{ steps.pwd.outputs.workspace-folder }}/fox_${{ env.MANIFEST_BRANCH }}
       working-directory: ${{ steps.pwd.outputs.workspace-folder }}
 
+    - name: Replace vendor/recovery with latest
+      run: |
+        /tmp/send_msg.sh "🔁 Updating vendor/recovery..."
+        cd "${{ steps.pwd.outputs.workspace-folder }}/fox_${{ env.MANIFEST_BRANCH }}"
+        rm -rf vendor/recovery
+        git clone --depth=1 -b fox_16.0-R12 \
+          https://gitlab.com/OrangeFox/vendor/recovery.git \
+          vendor/recovery
+      working-directory: ${{ steps.pwd.outputs.workspace-folder }}
+
     - name: Clone device tree
       run: |
         /tmp/send_msg.sh "🌲 Cloning device tree for \`${{ env.DEVICE_NAME }}\`..."
@@ -199,7 +212,9 @@ jobs:
       run: |
         cd ${{ steps.pwd.outputs.workspace-folder }}/fox_${{ env.MANIFEST_BRANCH }}/${{ env.DEVICE_PATH }}
         LATEST_COMMIT=$(git rev-parse --short=7 HEAD)
+        LATEST_COMMIT_FULL=$(git rev-parse HEAD)
         echo "LATEST_COMMIT=$LATEST_COMMIT" >> $GITHUB_OUTPUT
+        echo "LATEST_COMMIT_FULL=$LATEST_COMMIT_FULL" >> $GITHUB_OUTPUT
         echo "Latest device tree commit: $LATEST_COMMIT"
         DISPLAY_URL=$(echo "${{ env.ORIGINAL_URL }}" | sed 's|https://oauth2:[^@]*@|https://|')
         /tmp/send_msg.sh "🌲 Device tree: [${LATEST_COMMIT}](${DISPLAY_URL}/tree/$LATEST_COMMIT)"
@@ -210,24 +225,52 @@ jobs:
       with:
         swap-size-gb: 40
 
+    - name: Show system resources
+      run: |
+        /tmp/send_msg.sh "📊 Checking runner resources..."
+        echo "CPU cores:"
+        nproc
+        echo
+        echo "Memory:"
+        free -h
+        echo
+        echo "Disk:"
+        df -h
+      working-directory: ${{ steps.pwd.outputs.workspace-folder }}
+
     - name: Building recovery
       run: |
         /tmp/send_msg.sh "⚙️ Starting build for \`${{ env.DEVICE_NAME }}\`..."
-        cd ${{ steps.pwd.outputs.workspace-folder }}/fox_${{ env.MANIFEST_BRANCH }}
+        cd "${{ steps.pwd.outputs.workspace-folder }}/fox_${{ env.MANIFEST_BRANCH }}"
         set +e
         source build/envsetup.sh
         export ALLOW_MISSING_DEPENDENCIES=true
         set -e
         lunch ${{ env.MAKEFILE_NAME }}-bp2a-eng
-        mka adbd ${{ env.BUILD_TARGET }}image -j$(nproc --all)
+        if ! mka adbd ${{ env.BUILD_TARGET }}image -j$(nproc --all); then
+          /tmp/send_msg.sh "❌ Build failed for \`${{ env.DEVICE_NAME }}\` (\`${{ env.MANIFEST_BRANCH }}\`)\n🔗 [View Workflow Run](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})"
+          exit 1
+        fi
       working-directory: ${{ steps.pwd.outputs.workspace-folder }}
-      continue-on-error: true
 
     - name: Notify Build Failure
       if: failure()
       run: |
         /tmp/send_msg.sh "❌ Build failed for \`${{ env.DEVICE_NAME }}\` (\`${{ env.MANIFEST_BRANCH }}\`)\n🔗 [View Workflow Run](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})"
         exit 1
+
+    - name: Show system resources post-build
+      run: |
+        /tmp/send_msg.sh "📊 Post-build runner resources..."
+        echo "CPU cores:"
+        nproc
+        echo
+        echo "Memory:"
+        free -h
+        echo
+        echo "Disk:"
+        df -h
+      working-directory: ${{ steps.pwd.outputs.workspace-folder }}
 
     - name: Check output directory
       run: |
@@ -275,3 +318,74 @@ jobs:
         else
           /tmp/send_msg.sh "📦 *Build complete!* Artifact available in Actions tab (private, expires in 90 days)."
         fi
+
+    - name: Watch for device tree changes and dirty build
+      if: success()
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: |
+        START_TIME=$(date +%s)
+        BUILD_COUNT=0
+        CURRENT_COMMIT="${{ steps.devtree_commit.outputs.LATEST_COMMIT_FULL }}"
+        WORKSPACE="${{ steps.pwd.outputs.workspace-folder }}"
+        FOX_DIR="$WORKSPACE/fox_${{ env.MANIFEST_BRANCH }}"
+        DEVICE_DIR="$FOX_DIR/${{ env.DEVICE_PATH }}"
+        OUT_DIR="$FOX_DIR/out/target/product/${{ env.DEVICE_NAME }}"
+        /tmp/send_msg.sh "👀 Watching for device tree changes until the watch window ends..."
+        while true; do
+          NOW=$(date +%s)
+          ELAPSED=$((NOW - START_TIME))
+          if [ "$ELAPSED" -ge "${{ env.WATCH_UNTIL_SECONDS }}" ]; then
+            /tmp/send_msg.sh "⏱️ Watch window ended. No more dirty builds will be attempted."
+            break
+          fi
+          sleep "${{ env.WATCH_INTERVAL_SECONDS }}"
+          NOW=$(date +%s)
+          ELAPSED=$((NOW - START_TIME))
+          if [ "$ELAPSED" -ge "${{ env.WATCH_UNTIL_SECONDS }}" ]; then
+            break
+          fi
+          cd "$DEVICE_DIR"
+          git fetch origin "${{ env.DEVICE_TREE_BRANCH }}"
+          NEW_COMMIT=$(git rev-parse "origin/${{ env.DEVICE_TREE_BRANCH }}")
+          NEW_COMMIT_SHORT=$(echo "$NEW_COMMIT" | cut -c1-7)
+          CURRENT_COMMIT_SHORT=$(echo "$CURRENT_COMMIT" | cut -c1-7)
+          if [ "$NEW_COMMIT" = "$CURRENT_COMMIT" ]; then
+            echo "No device tree change detected. Current commit: $CURRENT_COMMIT_SHORT"
+            continue
+          fi
+          BUILD_COUNT=$((BUILD_COUNT + 1))
+          /tmp/send_msg.sh "🆕 Device tree change detected: \`${CURRENT_COMMIT_SHORT}\` → \`${NEW_COMMIT_SHORT}\`\n🔄 Updating device tree and vendor/recovery, then starting dirty build #${BUILD_COUNT}..."
+          git reset --hard "$NEW_COMMIT"
+          CURRENT_COMMIT="$NEW_COMMIT"
+          cd "$FOX_DIR"
+          rm -rf vendor/recovery
+          git clone --depth=1 -b fox_16.0-R12 \
+            https://gitlab.com/OrangeFox/vendor/recovery.git \
+            vendor/recovery
+          set +e
+          source build/envsetup.sh
+          export ALLOW_MISSING_DEPENDENCIES=true
+          set -e
+          lunch ${{ env.MAKEFILE_NAME }}-bp2a-eng
+          /tmp/send_msg.sh "🔨 Dirty build #${BUILD_COUNT} compilation started..."
+          if ! mka adbd ${{ env.BUILD_TARGET }}image -j$(nproc --all); then
+            /tmp/send_msg.sh "❌ Dirty build #${BUILD_COUNT} failed at commit \`${NEW_COMMIT_SHORT}\`. I will keep watching for another device tree change."
+            continue
+          fi
+          TAG_NAME="${{ github.run_id }}-${BUILD_COUNT}"
+          RELEASE_NAME="${{ env.DEVICE_NAME }}-${TAG_NAME}"
+          /tmp/send_msg.sh "📦 Uploading dirty build #${BUILD_COUNT}..."
+          gh release create "$TAG_NAME" \
+            "$OUT_DIR/recovery.img" \
+            "$OUT_DIR"/OrangeFox-R*.zip \
+            --title "$RELEASE_NAME" \
+            --notes "Manifest: ${{ env.MANIFEST_BRANCH }}
+        Device: ${{ env.DEVICE_NAME }}
+        Target: ${{ env.BUILD_TARGET }}
+        Dirty build: #${BUILD_COUNT}
+        Device tree commit: ${NEW_COMMIT_SHORT}
+        Device tree URL: ${{ env.ORIGINAL_URL }}/tree/${NEW_COMMIT_SHORT}"
+          RELEASE_URL="https://github.com/${{ github.repository }}/releases/tag/${TAG_NAME}"
+          /tmp/send_msg.sh "📦 *Dirty build #${BUILD_COUNT} complete!*\n🔗 [Download]($RELEASE_URL)\n🌲 Device tree commit: [${NEW_COMMIT_SHORT}](${{ env.ORIGINAL_URL }}/tree/${NEW_COMMIT_SHORT})"
+        done
